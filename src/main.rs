@@ -1,127 +1,242 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#![forbid(unsafe_code)]
 
-use std::env;
-use std::fs;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
-mod ufs;
+use cap_std::fs::{Dir, OpenOptions};
+use clap::{Parser, Subcommand};
+use filetime::FileTime;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use ufsreader::{FileSystem, Format, Inode, Result};
 
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Read-only UFS1 filesystem inspection and extraction (Unix hosts)"
+)]
+struct Args {
+    #[arg(long, default_value = "riscix", global = true)]
+    format: Format,
+    /// Byte offset of the filesystem inside the image.
+    #[arg(long, default_value_t = 0, global = true)]
+    offset: u64,
+    /// Byte length of the filesystem slice.
+    #[arg(long, global = true)]
+    length: Option<u64>,
+    #[arg(long, default_value_t = 100_000, global = true)]
+    max_entries: usize,
+    /// Maximum total regular-file bytes processed, counting hard-link paths.
+    #[arg(long, default_value_t = 68_719_476_736, global = true)]
+    max_bytes: u64,
+    /// Extract only regular files/directories, keeping owner access and recording
+    /// symlinks and original permissions in metadata (for catalogue ingestion).
+    #[arg(long, global = true)]
+    content_only: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+#[derive(Subcommand)]
+enum Command {
+    /// Validate and print filesystem geometry as JSON.
+    Info { image: PathBuf },
+    /// Recursive JSON Lines listing, optionally hashing file contents.
+    List {
+        image: PathBuf,
+        #[arg(long)]
+        hashes: bool,
+    },
+    /// Stream a regular file to stdout; symbolic links resolve within the image.
+    Cat { image: PathBuf, path: String },
+    /// Extract into a NEW directory, emitting JSON Lines metadata to stdout.
+    Extract {
+        image: PathBuf,
+        destination: PathBuf,
+    },
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+struct HashWriter<W> {
+    out: W,
+    hash: Sha256,
+}
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+        let n = self.out.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.out.flush()
+    }
+}
+fn record(
+    out: &mut impl Write,
+    path: &[u8],
+    inode: &Inode,
+    hash: Option<String>,
+    target: Option<&[u8]>,
+    action: &str,
+) -> Result<()> {
+    let value = json!({
+        "schema_version": 1,
+        "path": String::from_utf8_lossy(path), "path_hex": hex(path),
+        "inode": inode, "sha256": hash,
+        "symlink_target": target.map(String::from_utf8_lossy),
+        "symlink_target_hex": target.map(hex), "action": action,
+    });
+    serde_json::to_writer(&mut *out, &value)?;
+    out.write_all(b"\n")
+}
+fn budget(remaining: &mut u64, inode: &Inode) -> Result<()> {
+    if inode.is_file() {
+        *remaining = remaining
+            .checked_sub(inode.size)
+            .ok_or_else(|| io::Error::other("regular-file byte limit exceeded"))?;
+    }
+    Ok(())
+}
+fn set_metadata(file: &File, inode: &Inode) -> Result<()> {
+    filetime::set_file_handle_times(
+        file,
+        Some(FileTime::from_unix_time(inode.atime, 0)),
+        Some(FileTime::from_unix_time(inode.mtime, 0)),
+    )?;
+    // Keep ordinary rwx bits. Ownership, set-ID and special bits are recorded
+    // rather than applied to host files.
+    file.set_permissions(fs::Permissions::from_mode(u32::from(inode.mode & 0o777)))
+}
+
+fn run(args: Args) -> Result<()> {
+    let image = match &args.command {
+        Command::Info { image }
+        | Command::List { image, .. }
+        | Command::Cat { image, .. }
+        | Command::Extract { image, .. } => image,
+    };
+    let fs = FileSystem::open(File::open(image)?, args.offset, args.length, args.format)?;
+    let mut out = BufWriter::new(io::stdout().lock());
+    let mut remaining = args.max_bytes;
+    match args.command {
+        Command::Info { .. } => {
+            serde_json::to_writer(&mut out, &fs.superblock)?;
+            writeln!(out)?;
+        }
+        Command::Cat { path, .. } => {
+            let inode = fs.lookup(path.as_bytes())?;
+            budget(&mut remaining, &inode)?;
+            fs.copy(&inode, &mut out)?;
+        }
+        Command::List { hashes, .. } => {
+            fs.walk(args.max_entries, |path, inode| {
+                let hash = if hashes && inode.is_file() {
+                    budget(&mut remaining, inode)?;
+                    let mut writer = HashWriter {
+                        out: io::sink(),
+                        hash: Sha256::new(),
+                    };
+                    fs.copy(inode, &mut writer)?;
+                    Some(hex(&writer.hash.finalize()))
+                } else {
+                    None
+                };
+                let target = if inode.is_symlink() {
+                    Some(fs.read_link(inode)?)
+                } else {
+                    None
+                };
+                record(&mut out, path, inode, hash, target.as_deref(), "listed")
+            })?;
+        }
+        Command::Extract { destination, .. } => {
+            // A fresh directory plus capability-relative operations prevents
+            // existing symlinks from redirecting writes outside the destination.
+            fs::create_dir(&destination)?;
+            let root = Dir::open_ambient_dir(&destination, cap_std::ambient_authority())?;
+            let mut links = Vec::new();
+            let mut directories = Vec::new();
+            let mut files: HashMap<u32, (PathBuf, String)> = HashMap::new();
+            fs.walk(args.max_entries, |path, inode| {
+                let relative = if path == b"/" {
+                    Path::new(".")
+                } else {
+                    Path::new(std::ffi::OsStr::from_bytes(&path[1..]))
+                };
+                let mut hash = None;
+                let mut target = None;
+                let action;
+                if inode.is_dir() {
+                    if path != b"/" {
+                        root.create_dir(relative)?;
+                    }
+                    directories.push((relative.to_path_buf(), inode.clone()));
+                    action = "directory";
+                } else if inode.is_file() {
+                    budget(&mut remaining, inode)?;
+                    if let Some((first, digest)) = files.get(&inode.number) {
+                        root.hard_link(first, &root, relative)?;
+                        hash = Some(digest.clone());
+                        action = "hard_link";
+                    } else {
+                        let mut options = OpenOptions::new();
+                        options.write(true).create_new(true);
+                        let file = root.open_with(relative, &options)?.into_std();
+                        let mut writer = HashWriter {
+                            out: BufWriter::new(file),
+                            hash: Sha256::new(),
+                        };
+                        fs.copy(inode, &mut writer)?;
+                        writer.flush()?;
+                        if !args.content_only {
+                            set_metadata(writer.out.get_ref(), inode)?;
+                        }
+                        let digest = hex(&writer.hash.finalize());
+                        if inode.nlink > 1 {
+                            files.insert(inode.number, (relative.to_path_buf(), digest.clone()));
+                        }
+                        hash = Some(digest);
+                        action = "file";
+                    }
+                } else if inode.is_symlink() {
+                    let value = fs.read_link(inode)?;
+                    links.push((relative.to_path_buf(), value.clone()));
+                    target = Some(value);
+                    action = "symlink";
+                } else {
+                    // Device nodes, FIFOs and sockets stay as metadata only.
+                    action = "special_metadata_only";
+                }
+                record(&mut out, path, inode, hash, target.as_deref(), action)
+            })?;
+            // Symlinks are created last, and never followed by the extractor.
+            if !args.content_only {
+                for (path, target) in links {
+                    root.symlink_contents(std::ffi::OsStr::from_bytes(&target), path)?;
+                }
+            }
+            // All recorded paths here are actual directories, not symlink
+            // entries. Finish children first so restrictive parent permissions
+            // cannot prevent access, and keep only one directory handle open.
+            if !args.content_only {
+                for (path, inode) in directories.into_iter().rev() {
+                    set_metadata(&root.open(path)?.into_std(), &inode)?;
+                }
+            }
+        }
+    }
+    out.flush()
+}
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: ufsreader fs");
-        panic!("fs")
+    if let Err(error) = run(Args::parse()) {
+        eprintln!("ufsreader: {error}");
+        std::process::exit(1);
     }
-    let disk = fs::read(&args[1]).expect("read filesystem");
-    let fs = ufs::FileSystem::new(&disk);
-    println!("fs.state = {:?}", fs.superblock().state());
-    println!("fs.flags = {:?}", fs.superblock().flags());
-    let root_inode = fs.root_inode();
-    println!("root mode: {:?}", root_inode.mode());
-    println!("root inode: {:#x?}", root_inode);
-    let rootdir = ufs::Directory::new(&root_inode);
-    dump_dir(&fs, &rootdir);
-
-    let kernel_inode = fs.namei(b"/kernel").expect("/kernel exists");
-    println!("kernel mode: {:?}", kernel_inode.mode());
-    let kerneldir = ufs::Directory::new(&kernel_inode);
-    dump_dir(&fs, &kerneldir);
-
-    let amd64_inode = fs.namei(b"/kernel/amd64").expect("/kernel/amd64 exists");
-    println!("/kernel/amd64 mode: {:?}", amd64_inode.mode());
-    let amd64dir = ufs::Directory::new(&amd64_inode);
-    dump_dir(&fs, &amd64dir);
-
-    let genunix_inode = fs
-        .namei(b"/kernel/amd64/genunix")
-        .expect("/kernel/amd64/genunix exists");
-    println!("genunix inode: {:#x?}", genunix_inode);
-    let mut genunixfile = vec![0u8; genunix_inode.size()];
-    genunix_inode
-        .read(0, &mut genunixfile)
-        .expect("read /kernel/amd64/genunix");
-    dump_file("target/tmp.genunix", &genunixfile);
-
-    let etc_inode = fs.namei(b"/etc").expect("/etc exists");
-    println!("etc mode: {:?}", etc_inode.mode());
-    let etcdir = ufs::Directory::new(&etc_inode);
-    dump_dir(&fs, &etcdir);
-
-    let driver_aliases_inode = fs
-        .namei(b"/etc/driver_aliases")
-        .expect("/etc/driver_aliases exists");
-    println!("driver_aliases mode: {:?}", driver_aliases_inode.mode());
-    let mut driver_aliases_file = vec![0u8; driver_aliases_inode.size()];
-    driver_aliases_inode
-        .read(0, &mut driver_aliases_file)
-        .expect("read /etc/driver_aliases");
-    let da = unsafe { core::str::from_utf8_unchecked(&driver_aliases_file) };
-    println!("Driver aliases content: |{da}|");
-
-    let platform_inode = fs.namei(b"/platform").expect("/platform exists");
-    println!("platform mode: {:?}", platform_inode.mode());
-    let platformdir = ufs::Directory::new(&platform_inode);
-    dump_dir(&fs, &platformdir);
-
-    let oxide_inode = fs
-        .namei(b"/platform/oxide")
-        .expect("/platform/oxide exists");
-    println!("oxide mode: {:?}", oxide_inode.mode());
-    let oxidedir = ufs::Directory::new(&oxide_inode);
-    dump_dir(&fs, &oxidedir);
-
-    let kernel_inode = fs
-        .namei(b"/platform/oxide/kernel")
-        .expect("/platform/oxide/kernel exists");
-    println!("kernel mode: {:?}", kernel_inode.mode());
-    let kerneldir = ufs::Directory::new(&kernel_inode);
-    dump_dir(&fs, &kerneldir);
-
-    let amd64_inode = fs
-        .namei(b"/platform/oxide/kernel/amd64")
-        .expect("/platform/oxide/kernel/amd64 exists");
-    println!("amd64 mode: {:?}", amd64_inode.mode());
-    let amd64dir = ufs::Directory::new(&amd64_inode);
-    dump_dir(&fs, &amd64dir);
-
-    let unix_inode = fs
-        .namei(b"/platform/oxide/kernel/amd64/unix")
-        .expect("/platform/oxide/kernel/amd64/unix exists");
-    println!("unix: {:#x?}", unix_inode);
-    let mut unixfile = vec![0u8; unix_inode.size()];
-    unix_inode
-        .read(0, &mut unixfile)
-        .expect("read /platform/oxide/kernel/amd64/unix");
-    dump_file("target/tmp.unix", &unixfile);
-
-    let log_inode = fs.namei(b"/etc/TIMEZONE").expect("/etc/TIMEZONE exists");
-    println!("log: {log_inode:#x?}");
-}
-
-fn dump_dir(fs: &ufs::FileSystem<'_>, dir: &ufs::Directory<'_>) {
-    // for dentry in dir.iter() {
-    //     println!("dir: {dentry:#?}");
-    // }
-    for dentry in dir.iter() {
-        let file = fs.inode(dentry.ino()).expect("got file");
-        println!(
-            "#{:<4} {:?} {:<2} {:<3} {:<3} {:>8} {}",
-            file.ino(),
-            file.mode(),
-            file.nlink(),
-            file.uid(),
-            file.gid(),
-            file.size(),
-            unsafe { core::str::from_utf8_unchecked(dentry.name()) }
-        );
-    }
-}
-
-fn dump_file(name: &str, file: &[u8]) {
-    use std::fs::File;
-    use std::io::prelude::*;
-    let mut f = File::create(name).expect("created {name}");
-    f.write_all(file).expect("wrote {name}");
-    println!("dumped '{name}' (size: {size})", size = file.len());
 }
